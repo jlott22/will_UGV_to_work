@@ -18,7 +18,6 @@ This task manager only assigns GPS waypoints and maintains the search/belief map
 
 TODO:
 4. Confirm LiDAR yaw offset so 0 degrees actually means vehicle-forward.
-5. Implement and Test Mosquitto broker locally on Jetson.
 6. Test TaskManager + Navigation MQTT message flow with mosquitto_sub.
 7. Try to implement a PID controller instead of burst commands
 9. Implement camera script publishing only numeric interrogation result.
@@ -32,6 +31,7 @@ TODO:
 
 import json
 import math
+import os
 import time
 import heapq
 from dataclasses import dataclass
@@ -63,6 +63,11 @@ TEAM_IDS = [ROBOT_ID] + PEER_IDS
 MQTT_BROKER_HOST = "localhost"  # local broker on this Jetson
 MQTT_BROKER_PORT = 1883
 MQTT_KEEPALIVE = 10
+
+TRIAL_ID = time.strftime("%Y%m%d-%H%M%S")
+LOG_DIR = "/home/jetson-nano/ugv/logs"
+TASK_EVENT_LOG_FILE = "task-events.jsonl"
+TASK_ERROR_LOG_FILE = "task-errors.jsonl"
 
 CELL_SIZE_M = 1.0               # USER EDIT: 1.0 m x 1.0 m grid cells
 # Grid resolution is 1.0 m per cell. TaskManager and Navigation must use the same value.
@@ -131,6 +136,109 @@ TOPIC_CMD_STOP = f"/ugv/{ROBOT_ID}/cmd/stop"             # task_manager -> nav
 # messages to peer/incoming.
 TOPIC_PEER_OUT = f"/ugv/{ROBOT_ID}/peer/outgoing"        # task_manager -> ESP-NOW bridge
 TOPIC_PEER_IN = f"/ugv/{ROBOT_ID}/peer/incoming"         # ESP-NOW bridge -> task_manager
+
+
+# ===========================================================
+# Persistent JSONL logging
+# ===========================================================
+
+def trial_log_filename(base_name: str) -> str:
+    root, ext = os.path.splitext(base_name)
+    filename = f"{root}-{TRIAL_ID}{ext or '.jsonl'}"
+    return os.path.join(LOG_DIR, filename)
+
+
+TASK_EVENT_LOG_PATH = trial_log_filename(TASK_EVENT_LOG_FILE)
+TASK_ERROR_LOG_PATH = trial_log_filename(TASK_ERROR_LOG_FILE)
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def write_jsonl(path: str, entry: Dict[str, Any]):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(json_safe(entry), separators=(",", ":")) + "\n")
+            fh.flush()
+    except Exception as exc:
+        try:
+            print(f"WARNING failed writing log {path}: {exc}")
+        except Exception:
+            pass
+
+
+def log_task_event(event_type: str, fields: Optional[Dict[str, Any]] = None):
+    write_jsonl(
+        TASK_EVENT_LOG_PATH,
+        {
+            "timestamp": time.time(),
+            "trial_id": TRIAL_ID,
+            "robot_id": ROBOT_ID,
+            "event_type": event_type,
+            "fields": fields or {},
+        },
+    )
+
+
+def log_task_error(event_type: str, exc_or_message, fields: Optional[Dict[str, Any]] = None):
+    write_jsonl(
+        TASK_ERROR_LOG_PATH,
+        {
+            "timestamp": time.time(),
+            "trial_id": TRIAL_ID,
+            "robot_id": ROBOT_ID,
+            "event_type": event_type,
+            "error": repr(exc_or_message),
+            "fields": fields or {},
+        },
+    )
+
+
+def task_program_start_fields() -> Dict[str, Any]:
+    return {
+        "trial_id": TRIAL_ID,
+        "robot_id": ROBOT_ID,
+        "script_name": os.path.basename(__file__),
+        "timestamp": time.time(),
+        "current_working_directory": os.getcwd(),
+        "event_log": TASK_EVENT_LOG_PATH,
+        "error_log": TASK_ERROR_LOG_PATH,
+        "key_config": {
+            "log_dir": LOG_DIR,
+            "single_robot_mode": SINGLE_ROBOT_MODE,
+            "single_robot_map_width_m": SINGLE_ROBOT_MAP_WIDTH_M,
+            "single_robot_map_height_m": SINGLE_ROBOT_MAP_HEIGHT_M,
+            "multi_robot_peer_ids": MULTI_ROBOT_PEER_IDS,
+            "mqtt_broker_host": MQTT_BROKER_HOST,
+            "mqtt_broker_port": MQTT_BROKER_PORT,
+            "cell_size_m": CELL_SIZE_M,
+            "reward_factor": REWARD_FACTOR,
+            "target_decay_exp": TARGET_DECAY_EXP,
+            "clue_decay_exp": CLUE_DECAY_EXP,
+            "visited_step_penalty": VISITED_STEP_PENALTY,
+            "unknown_object_bonus": UNKNOWN_OBJECT_BONUS,
+            "interrogation_timeout_s": INTERROGATION_TIMEOUT_S,
+            "plan_interval_s": PLAN_INTERVAL_S,
+        },
+    }
+
+
+def task_program_shutdown_fields(reason: str) -> Dict[str, Any]:
+    return {
+        "trial_id": TRIAL_ID,
+        "robot_id": ROBOT_ID,
+        "script_name": os.path.basename(__file__),
+        "timestamp": time.time(),
+        "reason": reason,
+    }
 
 
 # ===========================================================
@@ -328,6 +436,8 @@ class AuctionGreedyTaskManager:
     # =======================================================
 
     def start(self):
+        shutdown_reason = "normal_exit"
+        log_task_event("program_start", task_program_start_fields())
         self.client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_KEEPALIVE)
         self.client.loop_start()
         print(f"TaskManager {ROBOT_ID} connected to MQTT {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}")
@@ -350,13 +460,17 @@ class AuctionGreedyTaskManager:
                         self.last_plan_time = now
                 time.sleep(MAIN_LOOP_SLEEP_S)
         finally:
+            if self.found_target:
+                shutdown_reason = "target_found"
             self.publish_stop(reason="task_manager_exit")
+            log_task_event("program_shutdown", task_program_shutdown_fields(shutdown_reason))
             self.client.loop_stop()
             self.client.disconnect()
 
     def on_connect(self, client, userdata, flags, rc):
         if rc != 0:
             print(f"MQTT connection failed rc={rc}")
+            log_task_error("mqtt_connection_failed", f"rc={rc}", {"rc": rc})
             return
 
         # USER-EDITABLE COMMUNICATION PROCESSING:
@@ -373,12 +487,14 @@ class AuctionGreedyTaskManager:
         for topic in topics:
             client.subscribe(topic)
             print(f"Subscribed: {topic}")
+        log_task_event("mqtt_connected", {"topics": topics})
 
     def on_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
         except Exception as exc:
             print(f"Bad JSON on {msg.topic}: {exc}")
+            log_task_error("mqtt_bad_json", exc, {"topic": msg.topic, "payload": msg.payload.decode("utf-8", errors="ignore")})
             return
 
         try:
@@ -396,6 +512,7 @@ class AuctionGreedyTaskManager:
                 self.handle_peer_message(payload)
         except Exception as exc:
             print(f"Error handling {msg.topic}: {exc}")
+            log_task_error("mqtt_handler_error", exc, {"topic": msg.topic, "payload": payload})
 
     # =======================================================
     # USER-EDITABLE MESSAGE FORMAT: navigation input
@@ -420,6 +537,7 @@ class AuctionGreedyTaskManager:
         self.my_startup_gps = (lat, lon)
         self.my_pose = Pose(lat, lon, data.get("heading_deg"), data.get("timestamp", time.time()))
         self.heading_index = heading_index_from_degrees(data.get("heading_deg"))
+        log_task_event("nav_startup_received", {"payload": data, "startup_gps": self.my_startup_gps, "heading_index": self.heading_index})
 
         self.publish_peer("startup", {
             "lat": lat,
@@ -453,6 +571,7 @@ class AuctionGreedyTaskManager:
         heading_deg = data.get("heading_deg")
         status = data.get("status", "unknown")
         self.my_pose = Pose(lat, lon, heading_deg, data.get("timestamp", time.time()))
+        log_task_event("nav_status_received", {"payload": data})
 
         if self.map is None:
             return
@@ -473,15 +592,18 @@ class AuctionGreedyTaskManager:
 
         if status == "waypoint_reached":
             if self.mark_free_searched(new_cell):
+                log_task_event("cell_marked_free_searched", {"robot_cell": new_cell, "observed_cell": new_cell, "source": "navigation", "robot_heading_deg": heading_deg})
                 self.publish_cell_update(new_cell, "free_searched", source="navigation")
             if self.last_waypoint_cell == new_cell:
                 self.last_waypoint_cell = None
+            log_task_event("waypoint_reached_processed", {"robot_cell": new_cell, "heading_deg": heading_deg, "payload": data})
             if self.current_interrogation_target is not None:
                 # Interrogation arrival: the reached waypoint is free/searched,
                 # but the occupied target is not searched-empty. The final
                 # approach heading was planned to face the target, so TaskManager
                 # waits for perception rather than publishing another waypoint.
                 self.interrogation_wait_started_at = time.time()
+                log_task_event("interrogation_started", {"observation_cell": new_cell, "target_cell": self.current_interrogation_target})
                 print(
                     "Waiting for interrogation result for "
                     f"target={self.current_interrogation_target} from observation_cell={new_cell}"
@@ -492,6 +614,7 @@ class AuctionGreedyTaskManager:
             self.clear_current_goal()
             self.current_path = []
             self.path_replan_count += 1
+            log_task_event("replan_triggered", {"reason": status, "robot_cell": new_cell})
             self.plan_and_publish_if_needed(force=True)
 
     def process_observed_cells(self, data: Dict[str, Any]):
@@ -500,9 +623,11 @@ class AuctionGreedyTaskManager:
         # that "searched" only means "robot drove into that exact cell."
         for cell in self.cells_from_observation_list(data.get("observed_free_cells", [])):
             if self.mark_free_searched(cell):
+                log_task_event("cell_marked_free_searched", {"observed_cell": cell, "source": "lidar_status_compat"})
                 self.publish_cell_update(cell, "free_searched", source="lidar")
         for cell in self.cells_from_observation_list(data.get("occupied_unknown_cells", [])):
             if self.mark_occupied_unknown(cell):
+                log_task_event("cell_marked_occupied_unknown", {"observed_cell": cell, "source": "lidar_status_compat"})
                 self.publish_cell_update(cell, "occupied_unknown", source="lidar")
 
     def cells_from_observation_list(self, observations: Any) -> List[Cell]:
@@ -538,7 +663,9 @@ class AuctionGreedyTaskManager:
 
         target = self.current_interrogation_target
         print(f"Interrogation timed out for target={target}; marking obstacle and replanning.")
+        log_task_event("interrogation_timeout", {"target_cell": target})
         self.mark_obstacle(target)
+        log_task_event("cell_marked_obstacle", {"observed_cell": target, "source": "camera", "reason": "interrogation_timeout"})
         self.publish_cell_update(target, "obstacle", source="camera", reason="interrogation_timeout")
         self.clear_current_goal()
         self.current_path = []
@@ -604,6 +731,16 @@ class AuctionGreedyTaskManager:
         robot_cell = self.map.gps_to_cell(robot_lat, robot_lon)
         if robot_cell is None:
             return
+        log_task_event(
+            "adjacent_scan_received",
+            {
+                "robot_lat": robot_lat,
+                "robot_lon": robot_lon,
+                "robot_cell": robot_cell,
+                "heading_deg": heading_deg,
+                "scan": data.get("scan", []),
+            },
+        )
 
         self.my_pose = Pose(robot_lat, robot_lon, heading_deg, data.get("timestamp", time.time()))
         measured_heading = heading_index_from_degrees(heading_deg)
@@ -619,18 +756,61 @@ class AuctionGreedyTaskManager:
             occupied = bool(item.get("occupied", False))
             if occupied:
                 cell = self.occupied_scan_cell(item)
+                log_task_event(
+                    "adjacent_scan_item_processed",
+                    {
+                        "robot_cell": robot_cell,
+                        "direction": item.get("direction"),
+                        "occupied": True,
+                        "object_lat": item.get("object_lat"),
+                        "object_lon": item.get("object_lon"),
+                        "object_cell": cell,
+                        "distance_m": item.get("distance_m"),
+                    },
+                )
                 if cell is None:
                     continue
                 if self.mark_occupied_unknown(cell):
+                    log_task_event(
+                        "cell_marked_occupied_unknown",
+                        {
+                            "robot_cell": robot_cell,
+                            "observed_cell": cell,
+                            "source": "lidar",
+                            "direction": item.get("direction"),
+                            "distance_m": item.get("distance_m"),
+                            "robot_heading_deg": heading_deg,
+                        },
+                    )
                     self.publish_cell_update(cell, "occupied_unknown", source="lidar")
                     changed = True
                 continue
 
             cell = self.free_adjacent_scan_cell(robot_cell, heading_deg, item)
+            log_task_event(
+                "adjacent_scan_item_processed",
+                {
+                    "robot_cell": robot_cell,
+                    "direction": item.get("direction"),
+                    "occupied": False,
+                    "free_adjacent_cell": cell,
+                    "distance_m": item.get("distance_m"),
+                },
+            )
             if cell is None:
                 continue
             before = self.grid[self.map.idx(cell)]
             if self.mark_free_searched(cell):
+                log_task_event(
+                    "cell_marked_free_searched",
+                    {
+                        "robot_cell": robot_cell,
+                        "observed_cell": cell,
+                        "source": "lidar",
+                        "direction": item.get("direction"),
+                        "robot_heading_deg": heading_deg,
+                    },
+                )
                 self.publish_cell_update(cell, "free_searched", source="lidar")
             if self.grid[self.map.idx(cell)] != before:
                 changed = True
@@ -638,6 +818,7 @@ class AuctionGreedyTaskManager:
         if changed:
             self.current_path = []
             self.path_replan_count += 1
+            log_task_event("replan_triggered", {"reason": "adjacent_scan_changed_map", "robot_cell": robot_cell})
 
         # Adjacent scans are treated as waypoint-stop observations. Planning the
         # next waypoint is normally triggered by waypoint_reached, not by the
@@ -696,12 +877,14 @@ class AuctionGreedyTaskManager:
         cell = self.map.gps_to_cell(lat, lon)
         if cell is None:
             return
+        log_task_event("clue_detection_received", {"payload": data, "cell": cell})
 
         if clue_id in TARGET_FOUND_CLUE_IDS:
             self.grid[self.map.idx(cell)] = CELL_TARGET_FOUND
             self.handle_target_found(lat, lon, source="local_clue_detection", clue_id=clue_id)
         else:
             self.mark_occupied_clue(cell)
+            log_task_event("cell_marked_occupied_clue", {"observed_cell": cell, "source": "camera", "clue_id": clue_id, "confidence": confidence})
             self.publish_cell_update(
                 cell,
                 "occupied_clue",
@@ -740,6 +923,7 @@ class AuctionGreedyTaskManager:
             return
 
         cell = self.current_interrogation_target
+        log_task_event("interrogation_result_received", {"raw_result": data, "target_cell": cell})
 
         try:
             clue_id = int(data)
@@ -753,6 +937,7 @@ class AuctionGreedyTaskManager:
         # For this phase, treat that occupied cell as a confirmed hard obstacle.
         if clue_id == 0:
             self.mark_obstacle(cell)
+            log_task_event("cell_marked_obstacle", {"observed_cell": cell, "source": "camera", "reason": "no_recognized_clue"})
             self.publish_cell_update(cell, "obstacle", source="camera", reason="no_recognized_clue")
 
         # clue_id 1 means target found.
@@ -765,6 +950,7 @@ class AuctionGreedyTaskManager:
         # Any other positive ID is treated as a clue / semantic feature.
         elif clue_id > 0:
             self.mark_occupied_clue(cell)
+            log_task_event("cell_marked_occupied_clue", {"observed_cell": cell, "source": "camera", "clue_id": clue_id, "confidence": 1.0})
             self.clue_count += 1
 
             if cell not in self.clue_cells:
@@ -789,6 +975,7 @@ class AuctionGreedyTaskManager:
         self.clear_current_goal()
         self.current_path = []
         self.path_replan_count += 1
+        log_task_event("replan_triggered", {"reason": "interrogation_result", "target_cell": cell})
         self.plan_and_publish_if_needed(force=True)
 
     # =======================================================
@@ -1005,6 +1192,17 @@ class AuctionGreedyTaskManager:
                 f"Initialized single-robot map: {self.map.width_cells} x {self.map.height_cells} cells "
                 f"({CELL_SIZE_M} m/cell), origin lat/lon=({self.map.origin_lat:.7f}, {self.map.origin_lon:.7f})"
             )
+            log_task_event(
+                "map_initialized",
+                {
+                    "mode": "single",
+                    "width_cells": self.map.width_cells,
+                    "height_cells": self.map.height_cells,
+                    "origin_lat": self.map.origin_lat,
+                    "origin_lon": self.map.origin_lon,
+                    "my_cell": self.my_cell,
+                },
+            )
             self.plan_and_publish_if_needed(force=True)
             return
 
@@ -1032,6 +1230,18 @@ class AuctionGreedyTaskManager:
         print(
             f"Initialized relative map: {self.map.width_cells} x {self.map.height_cells} cells "
             f"({CELL_SIZE_M} m/cell), origin lat/lon=({self.map.origin_lat:.7f}, {self.map.origin_lon:.7f})"
+        )
+        log_task_event(
+            "map_initialized",
+            {
+                "mode": "multi",
+                "width_cells": self.map.width_cells,
+                "height_cells": self.map.height_cells,
+                "origin_lat": self.map.origin_lat,
+                "origin_lon": self.map.origin_lon,
+                "my_cell": self.my_cell,
+                "peer_cells": {pid: peer.pos_cell for pid, peer in self.peers.items()},
+            },
         )
         self.plan_and_publish_if_needed(force=True)
 
@@ -1487,10 +1697,12 @@ class AuctionGreedyTaskManager:
         if self.last_waypoint_cell is not None and not force:
             return
 
+        log_task_event("planning_started", {"force": force, "my_cell": self.my_cell, "heading_index": self.heading_index})
         prev_goal = self.current_goal_cell
         selection = self.pick_goal()
         if selection is None:
             print("No available goal cells remain.")
+            log_task_event("path_failed", {"reason": "no_available_goal", "my_cell": self.my_cell})
             self.publish_stop(reason="no_available_goal")
             return
 
@@ -1508,25 +1720,38 @@ class AuctionGreedyTaskManager:
         else:
             self.current_interrogation_target = interrogation_target
             self.current_required_goal_heading = required_goal_heading
+        log_task_event(
+            "goal_selected",
+            {
+                "goal_cell": goal,
+                "interrogation_target": interrogation_target,
+                "required_goal_heading": required_goal_heading,
+                "my_cell": self.my_cell,
+            },
+        )
 
         path = self.a_star(self.my_cell, goal, required_goal_heading=required_goal_heading)
         if len(path) == 1 and goal == self.my_cell:
             self.current_path = path
+            log_task_event("path_planned", {"path": path, "goal_cell": goal, "my_cell": self.my_cell})
             self.publish_waypoint(self.my_cell, goal)
             return
         if len(path) < 2:
             self.clear_current_goal()
             self.current_path = []
             self.path_replan_count += 1
+            log_task_event("path_failed", {"reason": "a_star_no_path", "goal_cell": goal, "my_cell": self.my_cell})
             return
 
         next_cell = path[1]
         if self.i_should_yield(next_cell):
             self.yield_count += 1
             self.path_replan_count += 1
+            log_task_event("replan_triggered", {"reason": "yield_to_peer", "next_cell": next_cell})
             return
 
         self.current_path = path
+        log_task_event("path_planned", {"path": path, "goal_cell": goal, "next_cell": next_cell, "my_cell": self.my_cell})
         self.publish_waypoint(next_cell, goal)
 
     def publish_waypoint(self, next_cell: Cell, goal_cell: Cell):
@@ -1562,6 +1787,23 @@ class AuctionGreedyTaskManager:
             "timestamp": time.time(),
         }
         self.client.publish(TOPIC_CMD_WAYPOINT, json.dumps(payload))
+        log_task_event(
+            "waypoint_command_published",
+            {
+                "current_robot_cell": self.my_cell,
+                "next_waypoint_cell": next_cell,
+                "goal_cell": goal_cell,
+                "waypoint_lat": lat,
+                "waypoint_lon": lon,
+                "goal_lat": goal_lat,
+                "goal_lon": goal_lon,
+                "movement_type": "interrogation_observation" if self.current_interrogation_target is not None else "normal",
+                "interrogation_target": self.current_interrogation_target,
+                "current_heading_index": self.heading_index,
+                "planned_path": self.current_path,
+                "payload": payload,
+            },
+        )
         if self.current_interrogation_target is not None:
             print(
                 f"Waypoint -> cell={next_cell}, gps=({lat:.7f}, {lon:.7f}), "
@@ -1579,8 +1821,9 @@ class AuctionGreedyTaskManager:
         }
         try:
             self.client.publish(TOPIC_CMD_STOP, json.dumps(payload))
+            log_task_event("stop_published", payload)
         except Exception:
-            pass
+            log_task_error("stop_publish_failed", "publish failed", payload)
 
     def handle_target_found(self, lat: float, lon: float, source: str, clue_id: Optional[int]):
         if self.found_target:
@@ -1589,6 +1832,7 @@ class AuctionGreedyTaskManager:
         self.target_location_gps = (lat, lon)
         self.publish_stop(reason=f"target_found:{source}")
         self.publish_peer("target", {"lat": lat, "lon": lon, "clue_id": clue_id})
+        log_task_event("target_found", {"lat": lat, "lon": lon, "source": source, "clue_id": clue_id})
         print(f"TARGET FOUND by {source}: clue_id={clue_id}, gps=({lat:.7f}, {lon:.7f})")
 
 
@@ -1771,3 +2015,4 @@ def planner_state_parts(state_idx: int) -> Tuple[int, int]:
 if __name__ == "__main__":
     manager = AuctionGreedyTaskManager()
     manager.start()
+
