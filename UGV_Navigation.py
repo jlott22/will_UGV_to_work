@@ -20,6 +20,7 @@ Architecture rule:
 
 import json
 import math
+import os
 import select
 import signal
 import struct
@@ -54,6 +55,11 @@ MQTT_BROKER_HOST = "localhost"
 MQTT_BROKER_PORT = 1883
 MQTT_KEEPALIVE = 10
 
+TRIAL_ID = time.strftime("%Y%m%d-%H%M%S")
+LOG_DIR = "/home/jetson-nano/ugv/logs"
+NAV_EVENT_LOG_FILE = "nav-events.jsonl"
+NAV_ERROR_LOG_FILE = "nav-errors.jsonl"
+
 GPS_PORT = "/dev/ttyTHS1"
 GPS_BAUD = 115200
 
@@ -83,6 +89,13 @@ WAYPOINT_RADIUS_M = 0.25
 REQUIRE_RTK_FIXED = True
 MAX_H_ACC_M = 0.20
 MIN_HEADING_SPEED_MPS = 0.30
+INITIAL_HEADING_ENABLED = True
+INITIAL_HEADING_MIN_MOVE_M = 1.0
+INITIAL_HEADING_FORWARD_CMD = "F"
+INITIAL_HEADING_BURST_S = 0.30
+INITIAL_HEADING_MAX_ATTEMPTS = 8
+INITIAL_HEADING_MAX_TOTAL_S = 20.0
+INITIAL_HEADING_MIN_GROUND_SPEED_MPS = 0.05
 NO_FIX_SLEEP_S = 0.5
 IDLE_SLEEP_S = 0.1
 
@@ -115,6 +128,110 @@ TOPIC_CMD_STOP = f"/ugv/{ROBOT_ID}/cmd/stop"
 TOPIC_NAV_STARTUP = f"/ugv/{ROBOT_ID}/nav/startup"
 TOPIC_NAV_STATUS = f"/ugv/{ROBOT_ID}/nav/status"
 TOPIC_NAV_ADJACENT_SCAN = f"/ugv/{ROBOT_ID}/nav/adjacent_scan"
+
+
+# ===========================================================
+# Persistent JSONL logging
+# ===========================================================
+
+def trial_log_filename(base_name: str) -> str:
+    root, ext = os.path.splitext(base_name)
+    filename = f"{root}-{TRIAL_ID}{ext or '.jsonl'}"
+    return os.path.join(LOG_DIR, filename)
+
+
+NAV_EVENT_LOG_PATH = trial_log_filename(NAV_EVENT_LOG_FILE)
+NAV_ERROR_LOG_PATH = trial_log_filename(NAV_ERROR_LOG_FILE)
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def write_jsonl(path: str, entry: Dict[str, Any]):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(json_safe(entry), separators=(",", ":")) + "\n")
+            fh.flush()
+    except Exception as exc:
+        try:
+            print(f"{ts()} WARNING failed writing log {path}: {exc}")
+        except Exception:
+            pass
+
+
+def log_nav_event(event_type: str, fields: Optional[Dict[str, Any]] = None):
+    write_jsonl(
+        NAV_EVENT_LOG_PATH,
+        {
+            "timestamp": time.time(),
+            "trial_id": TRIAL_ID,
+            "robot_id": ROBOT_ID,
+            "event_type": event_type,
+            "fields": fields or {},
+        },
+    )
+
+
+def log_nav_error(event_type: str, exc_or_message, fields: Optional[Dict[str, Any]] = None):
+    write_jsonl(
+        NAV_ERROR_LOG_PATH,
+        {
+            "timestamp": time.time(),
+            "trial_id": TRIAL_ID,
+            "robot_id": ROBOT_ID,
+            "event_type": event_type,
+            "error": repr(exc_or_message),
+            "fields": fields or {},
+        },
+    )
+
+
+def nav_program_start_fields() -> Dict[str, Any]:
+    return {
+        "trial_id": TRIAL_ID,
+        "robot_id": ROBOT_ID,
+        "script_name": os.path.basename(__file__),
+        "timestamp": time.time(),
+        "current_working_directory": os.getcwd(),
+        "event_log": NAV_EVENT_LOG_PATH,
+        "error_log": NAV_ERROR_LOG_PATH,
+        "key_config": {
+            "log_dir": LOG_DIR,
+            "mqtt_broker_host": MQTT_BROKER_HOST,
+            "mqtt_broker_port": MQTT_BROKER_PORT,
+            "gps_port": GPS_PORT,
+            "gps_baud": GPS_BAUD,
+            "arduino_port": ARD_PORT,
+            "arduino_baud": ARD_BAUD,
+            "cell_size_m": CELL_SIZE_M,
+            "waypoint_radius_m": WAYPOINT_RADIUS_M,
+            "require_rtk_fixed": REQUIRE_RTK_FIXED,
+            "max_h_acc_m": MAX_H_ACC_M,
+            "min_heading_speed_mps": MIN_HEADING_SPEED_MPS,
+            "initial_heading_enabled": INITIAL_HEADING_ENABLED,
+            "initial_heading_min_move_m": INITIAL_HEADING_MIN_MOVE_M,
+            "lidar_occupied_threshold_m": LIDAR_OCCUPIED_THRESHOLD_M,
+            "lidar_hard_stop_m": LIDAR_HARD_STOP_M,
+        },
+    }
+
+
+def nav_program_shutdown_fields(reason: str) -> Dict[str, Any]:
+    return {
+        "trial_id": TRIAL_ID,
+        "robot_id": ROBOT_ID,
+        "script_name": os.path.basename(__file__),
+        "timestamp": time.time(),
+        "reason": reason,
+    }
 
 
 # ===========================================================
@@ -237,15 +354,22 @@ def open_serial_with_retry(port: str, baud: int, name: str) -> serial.Serial:
         try:
             ser = serial.Serial(port, baud, timeout=1)
             print(f"{ts()} Opened {name} on {port} @ {baud}")
+            log_nav_event("serial_open_success", {"name": name, "port": port, "baud": baud})
             return ser
         except Exception as exc:
             print(f"{ts()} Failed opening {name} on {port}: {exc}")
+            log_nav_error("serial_open_failure", exc, {"name": name, "port": port, "baud": baud})
             time.sleep(1.0)
 
 
 def send_cmd(ser: serial.Serial, cmd: str):
-    ser.write(cmd.encode("ascii"))
-    ser.flush()
+    log_nav_event("motor_command", {"cmd": cmd})
+    try:
+        ser.write(cmd.encode("ascii"))
+        ser.flush()
+    except Exception as exc:
+        log_nav_error("serial_write_failure", exc, {"cmd": cmd})
+        raise
 
 
 def stop_motors(ard: serial.Serial):
@@ -253,6 +377,7 @@ def stop_motors(ard: serial.Serial):
         send_cmd(ard, "S")
     except Exception as exc:
         print(f"{ts()} Failed to send stop command: {exc}")
+        log_nav_error("motor_command_failed", exc, {"cmd": "S"})
 
 
 UBX_SYNC_1 = 0xB5
@@ -386,6 +511,136 @@ def filtered_heading_from_fix(
     return last_valid_heading_deg, last_valid_heading_deg, False
 
 
+def read_usable_fix(gps: serial.Serial, timeout_s: float) -> Optional[Fix]:
+    end = time.time() + timeout_s
+    while time.time() < end:
+        fix = read_fix(gps, timeout_s=min(1.0, max(0.05, end - time.time())))
+        if fix_is_navigation_usable(fix):
+            return fix
+    return None
+
+
+def acquire_initial_heading(
+    gps: serial.Serial,
+    ard: serial.Serial,
+    nav: "NavigationNode",
+    running_check,
+) -> Optional[Tuple[Fix, float]]:
+    print(f"{ts()} Starting heading acquisition")
+    log_nav_event("heading_acquisition_start", {})
+    started_at = time.time()
+    last_status_publish = 0.0
+    start_fix: Optional[Fix] = None
+    latest_fix: Optional[Fix] = None
+    original_gps_timeout = getattr(gps, "timeout", None)
+
+    try:
+        gps.timeout = 0.05
+        while running_check() and time.time() - started_at < INITIAL_HEADING_MAX_TOTAL_S:
+            start_fix = read_usable_fix(gps, timeout_s=1.0)
+            if start_fix is not None:
+                latest_fix = start_fix
+                break
+
+            now = time.time()
+            if latest_fix is not None and now - last_status_publish >= STATUS_PUBLISH_INTERVAL_S:
+                nav.publish_status(latest_fix, None, "no_heading")
+                last_status_publish = now
+            stop_motors(ard)
+
+        if start_fix is None:
+            print(f"{ts()} Heading acquisition failed")
+            log_nav_event("heading_acquisition_failed", {"reason": "no_usable_start_fix"})
+            if latest_fix is not None:
+                nav.publish_status(latest_fix, None, "heading_acquisition_failed")
+            stop_motors(ard)
+            return None
+
+        for attempt in range(1, INITIAL_HEADING_MAX_ATTEMPTS + 1):
+            if not running_check() or time.time() - started_at >= INITIAL_HEADING_MAX_TOTAL_S:
+                break
+
+            print(f"{ts()} Heading acquisition burst {attempt}/{INITIAL_HEADING_MAX_ATTEMPTS}")
+            log_nav_event("heading_acquisition_burst", {"attempt": attempt})
+            send_cmd(ard, INITIAL_HEADING_FORWARD_CMD)
+            burst_end = time.time() + INITIAL_HEADING_BURST_S
+            fix: Optional[Fix] = None
+            while running_check() and time.time() < burst_end:
+                candidate = read_usable_fix(gps, timeout_s=min(0.2, max(0.05, burst_end - time.time())))
+                if candidate is not None:
+                    fix = candidate
+            stop_motors(ard)
+            time.sleep(SETTLE_TIME_S)
+
+            if fix is None:
+                fix = read_usable_fix(gps, timeout_s=1.5)
+            if fix is None:
+                now = time.time()
+                if latest_fix is not None and now - last_status_publish >= STATUS_PUBLISH_INTERVAL_S:
+                    nav.publish_status(latest_fix, None, "no_heading")
+                    last_status_publish = now
+                continue
+
+            latest_fix = fix
+            moved_m = haversine_m(start_fix.lat, start_fix.lon, fix.lat, fix.lon)
+            print(f"{ts()} Heading acquisition moved {moved_m:.2f} m")
+            log_nav_event(
+                "heading_acquisition_moved",
+                {
+                    "attempt": attempt,
+                    "moved_m": moved_m,
+                    "start_lat": start_fix.lat,
+                    "start_lon": start_fix.lon,
+                    "current_lat": fix.lat,
+                    "current_lon": fix.lon,
+                    "current_heading_deg": fix.heading_deg,
+                    "ground_speed_mps": fix.ground_speed_mps,
+                },
+            )
+
+            if moved_m < INITIAL_HEADING_MIN_MOVE_M:
+                now = time.time()
+                if now - last_status_publish >= STATUS_PUBLISH_INTERVAL_S:
+                    nav.publish_status(fix, None, "no_heading")
+                    last_status_publish = now
+                continue
+
+            gps_bearing = bearing_deg(start_fix.lat, start_fix.lon, fix.lat, fix.lon)
+            nav_pvt_heading: Optional[float] = None
+            if fix.ground_speed_mps >= INITIAL_HEADING_MIN_GROUND_SPEED_MPS:
+                nav_pvt_heading = float(fix.heading_deg) % 360.0
+            chosen_heading = nav_pvt_heading if nav_pvt_heading is not None else gps_bearing
+            print(
+                f"{ts()} Heading acquired: "
+                f"nav_pvt={nav_pvt_heading if nav_pvt_heading is not None else 'None'}, "
+                f"gps_bearing={gps_bearing:.1f}"
+            )
+            log_nav_event(
+                "heading_acquired",
+                {
+                    "nav_pvt_heading_deg": nav_pvt_heading,
+                    "gps_bearing_deg": gps_bearing,
+                    "chosen_heading_deg": chosen_heading,
+                    "moved_m": moved_m,
+                    "ground_speed_mps": fix.ground_speed_mps,
+                },
+            )
+            stop_motors(ard)
+            return fix, chosen_heading
+
+        print(f"{ts()} Heading acquisition failed")
+        log_nav_event("heading_acquisition_failed", {"reason": "attempt_or_timeout_limit"})
+        if latest_fix is not None:
+            nav.publish_status(latest_fix, None, "heading_acquisition_failed")
+        stop_motors(ard)
+        return None
+    except Exception:
+        stop_motors(ard)
+        raise
+    finally:
+        gps.timeout = original_gps_timeout
+
+
 def gps_quality_alarm():
     """Placeholder for a buzzer or external alert when RTK fixed navigation is lost."""
     pass
@@ -434,7 +689,8 @@ def parse_lidar_line(line: str) -> Optional[Tuple[float, float]]:
         if dist_mm <= 0:
             return None
         return theta, dist_mm / 1000.0
-    except Exception:
+    except Exception as exc:
+        log_nav_error("lidar_parse_error", exc, {"line": line})
         return None
 
 
@@ -469,7 +725,8 @@ def read_adjacent_scan(lidar_proc: subprocess.Popen, robot_lat: float, robot_lon
     while time.time() < end:
         try:
             ready, _, _ = select.select([stdout], [], [], 0.02)
-        except Exception:
+        except Exception as exc:
+            log_nav_error("lidar_select_error", exc)
             break
         if not ready:
             continue
@@ -566,9 +823,11 @@ class NavigationNode:
     def on_connect(self, client, userdata, flags, rc):
         if rc != 0:
             print(f"{ts()} MQTT connection failed rc={rc}")
+            log_nav_error("mqtt_connection_failed", f"rc={rc}", {"rc": rc})
             return
         client.subscribe(TOPIC_CMD_WAYPOINT)
         client.subscribe(TOPIC_CMD_STOP)
+        log_nav_event("mqtt_connected", {"topics": [TOPIC_CMD_WAYPOINT, TOPIC_CMD_STOP]})
         print(f"{ts()} MQTT connected. Subscribed to {TOPIC_CMD_WAYPOINT} and {TOPIC_CMD_STOP}")
 
     def on_message(self, client, userdata, msg):
@@ -576,10 +835,12 @@ class NavigationNode:
             data = json.loads(msg.payload.decode("utf-8"))
         except Exception as exc:
             print(f"{ts()} Bad JSON on {msg.topic}: {exc}")
+            log_nav_error("mqtt_bad_json", exc, {"topic": msg.topic, "payload": msg.payload.decode("utf-8", errors="ignore")})
             return
 
         if msg.topic == TOPIC_CMD_STOP:
             print(f"{ts()} STOP command received: {data}")
+            log_nav_event("stop_command_received", {"payload": data})
             self.state.request_stop()
             return
 
@@ -594,12 +855,23 @@ class NavigationNode:
                     timestamp=float(data.get("timestamp", time.time())),
                 )
                 self.state.set_waypoint(wp)
+                log_nav_event(
+                    "waypoint_received",
+                    {
+                        "waypoint_lat": wp.lat,
+                        "waypoint_lon": wp.lon,
+                        "waypoint_cell_x": wp.cell_x,
+                        "waypoint_cell_y": wp.cell_y,
+                        "payload": data,
+                    },
+                )
                 print(
                     f"{ts()} New waypoint: lat={wp.lat:.7f}, lon={wp.lon:.7f}, "
                     f"cell=({wp.cell_x},{wp.cell_y})"
                 )
             except Exception as exc:
                 print(f"{ts()} Invalid waypoint payload: {exc}; data={data}")
+                log_nav_error("waypoint_received_invalid", exc, {"payload": data})
 
     def connect(self):
         self.client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_KEEPALIVE)
@@ -621,6 +893,7 @@ class NavigationNode:
         if extra:
             payload.update(extra)
         self.client.publish(TOPIC_NAV_STATUS, json.dumps(payload))
+        log_nav_event("nav_status_published", {"status": status, "payload": payload})
 
     def publish_startup(self, fix: Fix, heading_deg: Optional[float]):
         payload = {
@@ -631,9 +904,11 @@ class NavigationNode:
             "timestamp": time.time(),
         }
         self.client.publish(TOPIC_NAV_STARTUP, json.dumps(payload))
+        log_nav_event("startup_published", {"payload": payload})
         print(f"{ts()} Published startup GPS lat={fix.lat:.7f}, lon={fix.lon:.7f}, heading={heading_deg}")
 
     def publish_adjacent_scan(self, fix: Fix, heading_deg: Optional[float], scan: List[Dict[str, Any]]):
+        active_wp, _ = self.state.snapshot()
         payload = {
             "robot_id": ROBOT_ID,
             "robot_lat": fix.lat,
@@ -643,6 +918,23 @@ class NavigationNode:
             "timestamp": time.time(),
         }
         self.client.publish(TOPIC_NAV_ADJACENT_SCAN, json.dumps(payload))
+        log_nav_event(
+            "lidar_scan_summary",
+            {
+                "robot_lat": fix.lat,
+                "robot_lon": fix.lon,
+                "robot_heading_deg": heading_deg,
+                "robot_cell_x": active_wp.cell_x if active_wp else None,
+                "robot_cell_y": active_wp.cell_y if active_wp else None,
+                "scan": scan,
+                "payload": payload,
+            },
+        )
+        for item in scan:
+            if item.get("occupied"):
+                log_nav_event("lidar_occupied_detection", item)
+            else:
+                log_nav_event("lidar_free_detection", item)
 
 
 # ===========================================================
@@ -652,11 +944,14 @@ class NavigationNode:
 def run():
     nav = NavigationNode()
     running = True
+    shutdown_reason = "normal_exit"
+    log_nav_event("program_start", nav_program_start_fields())
 
     def handle_signal(signum, frame):
-        nonlocal running
+        nonlocal running, shutdown_reason
         print(f"{ts()} Signal {signum} received; stopping navigation.")
         running = False
+        shutdown_reason = f"signal_{signum}"
         nav.state.request_stop()
 
     signal.signal(signal.SIGINT, handle_signal)
@@ -688,6 +983,7 @@ def run():
     navigation_was_usable = False
     rtk_loss_reported = False
     last_valid_heading_deg: Optional[float] = None
+    heading_acquisition_failed = False
 
     try:
         print(f"{ts()} UGV_Navigation.py started for ROBOT_ID={ROBOT_ID}")
@@ -732,6 +1028,31 @@ def run():
                 print(f"{ts()} RTK FIX RESTORED")
                 rtk_loss_reported = False
             navigation_was_usable = True
+
+            if heading_acquisition_failed and not startup_published:
+                stop_motors(ard)
+                now = time.time()
+                if now - last_status_publish >= STATUS_PUBLISH_INTERVAL_S:
+                    nav.publish_status(fix, None, "heading_acquisition_failed")
+                    last_status_publish = now
+                time.sleep(IDLE_SLEEP_S)
+                continue
+
+            if INITIAL_HEADING_ENABLED and not startup_published and last_valid_heading_deg is None:
+                result = acquire_initial_heading(
+                    gps,
+                    ard,
+                    nav,
+                    lambda: running and not nav.state.snapshot()[1],
+                )
+                if result is None:
+                    heading_acquisition_failed = True
+                    time.sleep(IDLE_SLEEP_S)
+                    continue
+
+                fix, acquired_heading = result
+                last_valid_heading_deg = acquired_heading
+
             current_heading, last_valid_heading_deg, heading_updated = filtered_heading_from_fix(
                 fix,
                 last_valid_heading_deg,
@@ -773,6 +1094,19 @@ def run():
 
             dist_m = haversine_m(fix.lat, fix.lon, wp.lat, wp.lon)
             target_bearing = bearing_deg(fix.lat, fix.lon, wp.lat, wp.lon)
+            log_nav_event(
+                "waypoint_active",
+                {
+                    "waypoint_lat": wp.lat,
+                    "waypoint_lon": wp.lon,
+                    "waypoint_cell_x": wp.cell_x,
+                    "waypoint_cell_y": wp.cell_y,
+                    "current_lat": fix.lat,
+                    "current_lon": fix.lon,
+                    "current_heading_deg": current_heading,
+                    "distance_to_waypoint_m": dist_m,
+                },
+            )
 
             # Adjacent LiDAR scans are only published at waypoint stops for this phase.
             # The environment is assumed static.
@@ -781,6 +1115,19 @@ def run():
                 print(
                     f"{ts()} WAYPOINT REACHED dist={dist_m:.2f}m "
                     f"cell=({wp.cell_x},{wp.cell_y}) -> S"
+                )
+                log_nav_event(
+                    "waypoint_reached",
+                    {
+                        "waypoint_lat": wp.lat,
+                        "waypoint_lon": wp.lon,
+                        "waypoint_cell_x": wp.cell_x,
+                        "waypoint_cell_y": wp.cell_y,
+                        "current_lat": fix.lat,
+                        "current_lon": fix.lon,
+                        "current_heading_deg": current_heading,
+                        "distance_to_waypoint_m": dist_m,
+                    },
                 )
                 scan = read_adjacent_scan(lidar_proc, fix.lat, fix.lon, current_heading)
                 nav.publish_adjacent_scan(fix, current_heading, scan)
@@ -811,6 +1158,19 @@ def run():
 
             if intended_distance is not None and intended_distance <= LIDAR_HARD_STOP_M:
                 stop_motors(ard)
+                log_nav_event(
+                    "blocked_or_hard_stop",
+                    {
+                        "reason": "hard_stop",
+                        "intended_sector": intended_sector,
+                        "intended_distance": intended_distance,
+                        "current_lat": fix.lat,
+                        "current_lon": fix.lon,
+                        "current_heading_deg": current_heading,
+                        "active_waypoint_cell_x": wp.cell_x,
+                        "active_waypoint_cell_y": wp.cell_y,
+                    },
+                )
                 nav.publish_status(
                     fix,
                     current_heading,
@@ -824,6 +1184,19 @@ def run():
 
             if intended_occupied:
                 stop_motors(ard)
+                log_nav_event(
+                    "blocked_or_hard_stop",
+                    {
+                        "reason": "intended_cell_occupied",
+                        "intended_sector": intended_sector,
+                        "intended_distance": intended_distance,
+                        "current_lat": fix.lat,
+                        "current_lon": fix.lon,
+                        "current_heading_deg": current_heading,
+                        "active_waypoint_cell_x": wp.cell_x,
+                        "active_waypoint_cell_y": wp.cell_y,
+                    },
+                )
                 nav.publish_status(
                     fix,
                     current_heading,
@@ -880,6 +1253,7 @@ def run():
 
     finally:
         print(f"{ts()} Shutting down navigation")
+        log_nav_event("program_shutdown", nav_program_shutdown_fields(shutdown_reason))
         stop_motors(ard)
         try:
             nav.disconnect()
@@ -905,3 +1279,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+
