@@ -17,12 +17,10 @@ responsible for GPS, LiDAR, Arduino motor commands, and physical movement.
 This task manager only assigns GPS waypoints and maintains the search/belief map.
 
 TODO:
-3. Add manual or IMU-based initial heading so object GPS projection works before GPS-derived heading is available. ***GET better data from gps/imu****
 4. Confirm LiDAR yaw offset so 0 degrees actually means vehicle-forward.
 5. Implement and Test Mosquitto broker locally on Jetson.
 6. Test TaskManager + Navigation MQTT message flow with mosquitto_sub.
 7. Try to implement a PID controller instead of burst commands
-8. Tune waypoint radius and movement burst timings on real car.
 9. Implement camera script publishing only numeric interrogation result.
 10. Test single-robot full loop: startup GPS -> map init -> waypoint -> scan -> reached -> next waypoint.
 11. Later: implement ESP-NOW bridge for peer/outgoing and peer/incoming.
@@ -463,16 +461,11 @@ class AuctionGreedyTaskManager:
         if new_cell is None:
             return
 
-        # Prefer navigation's measured heading when available. If it is absent,
-        # infer heading from cell-to-cell motion so the planner still carries a
-        # heading state without assuming turn-in-place behavior.
+        # Navigation owns heading estimation. Treat heading_deg as authoritative
+        # ZED-F9R NAV-PVT headMot and do not derive heading from GPS motion.
         measured_heading = heading_index_from_degrees(heading_deg)
         if measured_heading is not None:
             self.heading_index = measured_heading
-        if self.my_cell is not None and new_cell != self.my_cell:
-            moved_heading = heading_index_from_vector(cell_direction(self.my_cell, new_cell))
-            if measured_heading is None and moved_heading is not None:
-                self.heading_index = moved_heading
 
         self.my_cell = new_cell
         self.publish_peer("position", {"lat": lat, "lon": lon, "heading_deg": heading_deg})
@@ -1460,9 +1453,9 @@ class AuctionGreedyTaskManager:
         if self.heading_index is not None:
             return [self.heading_index]
 
-        # If navigation has not reported a heading yet, choose an initial
-        # heading toward the goal as a startup fallback. Once status messages
-        # include heading or movement, the planner uses the measured heading.
+        # If navigation has not reported heading_deg yet, choose an initial
+        # planner heading toward the goal. Once Navigation reports heading_deg,
+        # that authoritative NAV-PVT headMot value is used.
         goal_heading = heading_index_toward(start, goal)
         if goal_heading is not None:
             return [goal_heading]
