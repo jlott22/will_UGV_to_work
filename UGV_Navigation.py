@@ -7,7 +7,8 @@ Navigation process for the multi-UGV semantic search project.
 Responsibilities:
 - Read GPS from serial.
 - Read RPLidar scan data from the rplidar_sdk ultra_simple process.
-- Send simple movement commands to the Arduino motor controller.
+- Send continuous D,<servo_angle>,<throttle_pwm> commands to the Arduino.
+- Leave actuator application and failsafe stop handling to the Arduino sketch.
 - Receive GPS waypoint commands from TaskManager over local MQTT.
 - Drive to ONE waypoint, stop, publish waypoint_reached, then wait for the next waypoint.
 - Publish LiDAR adjacent-cell scan results for TaskManager map updates.
@@ -16,6 +17,9 @@ Architecture rule:
 - Navigation owns GPS, LiDAR thresholding, occupied-cell geometry, and motor commands.
 - TaskManager owns the grid, belief map, task allocation, and path planning.
 - Navigation does NOT receive interrogation targets, rotate commands, or camera commands.
+- Steering uses saturated proportional control from UBX NAV-PVT heading error.
+- Throttle is based only on distance to the active waypoint.
+- Deprecated Arduino F/L/R burst commands are not used for normal navigation.
 """
 
 import json
@@ -74,33 +78,40 @@ LIDAR_CMD = [
     "256000",
 ]
 
-# Arduino command timing. These preserve the burst-style control used by the
-# current navigation code, but the destination now comes from TaskManager.
-F_BURST_S = 0.55
-TURN_BURST_S = 0.35
-SMALL_TURN_BURST_S = 0.18
-SETTLE_TIME_S = 0.25
+# Arduino actuator tuning. The Arduino accepts:
+#   D,<servo_angle>,<throttle_pwm>
+#   S
+SERVO_CENTER = 90
+SERVO_LEFT_LIMIT = 60
+SERVO_RIGHT_LIMIT = 120
+MAX_STEER_DELTA = 30
+STEER_KP = 2.0
+HEADING_DEADBAND_DEG = 3.0
+
+PWM_STOP = 0
+MIN_MOVING_PWM = 20
+APPROACH_PWM = 22
+CRUISE_PWM = 35
+
+CONTROL_DT_S = 0.10
 
 ARDUINO_BOOT_WAIT_S = 3.0
 ARDUINO_POST_STOP_WAIT_S = 0.5
 
 # GPS navigation tuning.
 WAYPOINT_RADIUS_M = 0.25
+SLOW_RADIUS_M = 0.75
 REQUIRE_RTK_FIXED = True
 MAX_H_ACC_M = 0.20
 MIN_HEADING_SPEED_MPS = 0.30
 INITIAL_HEADING_ENABLED = True
 INITIAL_HEADING_MIN_MOVE_M = 1.0
-INITIAL_HEADING_FORWARD_CMD = "F"
-INITIAL_HEADING_BURST_S = 0.30
+INITIAL_HEADING_DRIVE_S = 0.30
 INITIAL_HEADING_MAX_ATTEMPTS = 8
 INITIAL_HEADING_MAX_TOTAL_S = 20.0
 INITIAL_HEADING_MIN_GROUND_SPEED_MPS = 0.05
 NO_FIX_SLEEP_S = 0.5
 IDLE_SLEEP_S = 0.1
-
-BIG_ERR_DEG = 45.0
-SMALL_ERR_DEG = 18.0
 
 # LiDAR scan behavior.
 # The TaskManager assumes Navigation owns LiDAR geometry and thresholding.
@@ -213,11 +224,24 @@ def nav_program_start_fields() -> Dict[str, Any]:
             "arduino_baud": ARD_BAUD,
             "cell_size_m": CELL_SIZE_M,
             "waypoint_radius_m": WAYPOINT_RADIUS_M,
+            "slow_radius_m": SLOW_RADIUS_M,
             "require_rtk_fixed": REQUIRE_RTK_FIXED,
             "max_h_acc_m": MAX_H_ACC_M,
             "min_heading_speed_mps": MIN_HEADING_SPEED_MPS,
             "initial_heading_enabled": INITIAL_HEADING_ENABLED,
             "initial_heading_min_move_m": INITIAL_HEADING_MIN_MOVE_M,
+            "initial_heading_drive_s": INITIAL_HEADING_DRIVE_S,
+            "servo_center": SERVO_CENTER,
+            "servo_left_limit": SERVO_LEFT_LIMIT,
+            "servo_right_limit": SERVO_RIGHT_LIMIT,
+            "max_steer_delta": MAX_STEER_DELTA,
+            "steer_kp": STEER_KP,
+            "heading_deadband_deg": HEADING_DEADBAND_DEG,
+            "pwm_stop": PWM_STOP,
+            "min_moving_pwm": MIN_MOVING_PWM,
+            "approach_pwm": APPROACH_PWM,
+            "cruise_pwm": CRUISE_PWM,
+            "control_dt_s": CONTROL_DT_S,
             "lidar_occupied_threshold_m": LIDAR_OCCUPIED_THRESHOLD_M,
             "lidar_hard_stop_m": LIDAR_HARD_STOP_M,
         },
@@ -363,7 +387,9 @@ def open_serial_with_retry(port: str, baud: int, name: str) -> serial.Serial:
 
 
 def send_cmd(ser: serial.Serial, cmd: str):
-    log_nav_event("motor_command", {"cmd": cmd})
+    if not cmd.endswith("\n"):
+        cmd = f"{cmd}\n"
+    log_nav_event("motor_command", {"cmd": cmd.rstrip("\n")})
     try:
         ser.write(cmd.encode("ascii"))
         ser.flush()
@@ -372,12 +398,105 @@ def send_cmd(ser: serial.Serial, cmd: str):
         raise
 
 
+def read_arduino_lines(ard: serial.Serial, max_lines: int = 5):
+    try:
+        available = getattr(ard, "in_waiting", 0)
+    except Exception as exc:
+        log_nav_error("arduino_read_available_failed", exc, {})
+        return
+
+    if not available:
+        return
+
+    buffer = getattr(read_arduino_lines, "_buffer", bytearray())
+    lines_read = 0
+
+    try:
+        while available and lines_read < max_lines:
+            chunk = ard.read(min(int(available), 256))
+            if not chunk:
+                break
+            buffer.extend(chunk)
+
+            while lines_read < max_lines:
+                newline_index = buffer.find(b"\n")
+                if newline_index < 0:
+                    break
+                raw_line = bytes(buffer[:newline_index]).strip()
+                del buffer[: newline_index + 1]
+                if raw_line:
+                    line = raw_line.decode("ascii", errors="replace")
+                    print(f"{ts()} ARD: {line}")
+                    log_nav_event("arduino_line", {"line": line})
+                    lines_read += 1
+
+            try:
+                available = getattr(ard, "in_waiting", 0)
+            except Exception:
+                available = 0
+    except Exception as exc:
+        log_nav_error("arduino_read_lines_failed", exc, {})
+    finally:
+        setattr(read_arduino_lines, "_buffer", buffer)
+
+
 def stop_motors(ard: serial.Serial):
     try:
-        send_cmd(ard, "S")
+        send_cmd(ard, "S\n")
+        read_arduino_lines(ard)
     except Exception as exc:
         print(f"{ts()} Failed to send stop command: {exc}")
         log_nav_error("motor_command_failed", exc, {"cmd": "S"})
+
+
+def clamp_int(value: int, low: int, high: int) -> int:
+    return max(low, min(high, int(value)))
+
+
+def steering_from_heading_error(err_deg: float) -> int:
+    if abs(err_deg) <= HEADING_DEADBAND_DEG:
+        return SERVO_CENTER
+
+    correction = STEER_KP * err_deg
+    correction = max(-MAX_STEER_DELTA, min(MAX_STEER_DELTA, correction))
+    servo_angle = int(round(SERVO_CENTER + correction))
+    return clamp_int(servo_angle, SERVO_LEFT_LIMIT, SERVO_RIGHT_LIMIT)
+
+
+def throttle_from_distance(dist_m: float) -> int:
+    if dist_m <= WAYPOINT_RADIUS_M:
+        throttle_pwm = PWM_STOP
+    elif dist_m <= SLOW_RADIUS_M:
+        throttle_pwm = APPROACH_PWM
+    else:
+        throttle_pwm = CRUISE_PWM
+
+    throttle_pwm = clamp_int(throttle_pwm, 0, 255)
+    if throttle_pwm > 0:
+        throttle_pwm = max(MIN_MOVING_PWM, throttle_pwm)
+    return throttle_pwm
+
+
+def send_drive_command(ard: serial.Serial, servo_angle: int, throttle_pwm: int):
+    servo_angle = clamp_int(servo_angle, SERVO_LEFT_LIMIT, SERVO_RIGHT_LIMIT)
+    throttle_pwm = clamp_int(throttle_pwm, 0, 255)
+    cmd = f"D,{servo_angle},{throttle_pwm}\n"
+    log_nav_event(
+        "motor_drive_command",
+        {"servo_angle": servo_angle, "throttle_pwm": throttle_pwm},
+    )
+    try:
+        ard.write(cmd.encode("ascii"))
+        ard.flush()
+    except Exception as exc:
+        log_nav_error(
+            "serial_write_failure",
+            exc,
+            {"cmd": cmd, "servo_angle": servo_angle, "throttle_pwm": throttle_pwm},
+        )
+        raise
+    print(f"{ts()} DRIVE servo={servo_angle} pwm={throttle_pwm}")
+    read_arduino_lines(ard)
 
 
 UBX_SYNC_1 = 0xB5
@@ -560,17 +679,17 @@ def acquire_initial_heading(
             if not running_check() or time.time() - started_at >= INITIAL_HEADING_MAX_TOTAL_S:
                 break
 
-            print(f"{ts()} Heading acquisition burst {attempt}/{INITIAL_HEADING_MAX_ATTEMPTS}")
-            log_nav_event("heading_acquisition_burst", {"attempt": attempt})
-            send_cmd(ard, INITIAL_HEADING_FORWARD_CMD)
-            burst_end = time.time() + INITIAL_HEADING_BURST_S
+            print(f"{ts()} Heading acquisition drive {attempt}/{INITIAL_HEADING_MAX_ATTEMPTS}")
+            log_nav_event("heading_acquisition_drive", {"attempt": attempt})
+            send_drive_command(ard, SERVO_CENTER, CRUISE_PWM)
+            drive_end = time.time() + INITIAL_HEADING_DRIVE_S
             fix: Optional[Fix] = None
-            while running_check() and time.time() < burst_end:
-                candidate = read_usable_fix(gps, timeout_s=min(0.2, max(0.05, burst_end - time.time())))
+            while running_check() and time.time() < drive_end:
+                candidate = read_usable_fix(gps, timeout_s=min(0.2, max(0.05, drive_end - time.time())))
                 if candidate is not None:
                     fix = candidate
             stop_motors(ard)
-            time.sleep(SETTLE_TIME_S)
+            time.sleep(CONTROL_DT_S)
 
             if fix is None:
                 fix = read_usable_fix(gps, timeout_s=1.5)
@@ -652,14 +771,6 @@ def print_fix_debug(fix: Fix, rtk_state: str):
         f"heading={fix.heading_deg:.1f}deg h_acc={fix.h_acc_m:.3f}m "
         f"carrSoln={fix.carr_soln} num_sv={fix.num_sv} RTK={rtk_state}"
     )
-
-
-def do_burst(ard: serial.Serial, cmd: str, duration_s: float):
-    print(f"{ts()} BURST {cmd} for {duration_s:.2f}s")
-    send_cmd(ard, cmd)
-    time.sleep(duration_s)
-    stop_motors(ard)
-    time.sleep(SETTLE_TIME_S)
 
 
 # ===========================================================
@@ -972,7 +1083,15 @@ def run():
 
     print(f"{ts()} Waiting {ARDUINO_BOOT_WAIT_S:.1f}s for Arduino boot/reset after serial open")
     time.sleep(ARDUINO_BOOT_WAIT_S)
+    read_arduino_lines(ard)
+    for reset_method in ("reset_input_buffer", "reset_output_buffer"):
+        try:
+            getattr(ard, reset_method)()
+        except Exception as exc:
+            print(f"{ts()} Arduino serial {reset_method} unavailable/failed: {exc}")
+            log_nav_error("arduino_serial_reset_failed", exc, {"method": reset_method})
     stop_motors(ard)
+    read_arduino_lines(ard)
     time.sleep(ARDUINO_POST_STOP_WAIT_S)
 
     nav.connect()
@@ -988,6 +1107,7 @@ def run():
     try:
         print(f"{ts()} UGV_Navigation.py started for ROBOT_ID={ROBOT_ID}")
         while running:
+            loop_start = time.time()
             wp, stop_requested = nav.state.snapshot()
 
             if stop_requested:
@@ -1156,8 +1276,12 @@ def run():
             intended_occupied = bool(intended_item and intended_item.get("occupied"))
             intended_distance = intended_item.get("distance_m") if intended_item else None
 
+            # Normal map updates should come from stopped waypoint scans. Moving
+            # LiDAR is only an emergency safety check; if it triggers, the
+            # stopped-scan/map-alignment assumption failed and must be logged.
             if intended_distance is not None and intended_distance <= LIDAR_HARD_STOP_M:
                 stop_motors(ard)
+                heading_error = normalize_angle_deg(target_bearing - current_heading)
                 log_nav_event(
                     "blocked_or_hard_stop",
                     {
@@ -1171,6 +1295,27 @@ def run():
                         "active_waypoint_cell_y": wp.cell_y,
                     },
                 )
+                nav.publish_adjacent_scan(fix, current_heading, scan)
+                log_nav_error(
+                    "unexpected_obstacle_while_moving",
+                    "LiDAR hard-stop obstacle detected while moving toward a waypoint that should have been pre-scanned free",
+                    {
+                        "reason": "hard_stop",
+                        "intended_sector": intended_sector,
+                        "intended_distance_m": intended_distance,
+                        "current_lat": fix.lat,
+                        "current_lon": fix.lon,
+                        "current_heading_deg": current_heading,
+                        "target_bearing_deg": target_bearing,
+                        "heading_error_deg": heading_error,
+                        "waypoint_lat": wp.lat,
+                        "waypoint_lon": wp.lon,
+                        "waypoint_cell_x": wp.cell_x,
+                        "waypoint_cell_y": wp.cell_y,
+                        "distance_to_waypoint_m": dist_m,
+                        "scan": scan,
+                    },
+                )
                 nav.publish_status(
                     fix,
                     current_heading,
@@ -1182,8 +1327,12 @@ def run():
                 time.sleep(IDLE_SLEEP_S)
                 continue
 
+            # Normal map updates should come from stopped waypoint scans. Moving
+            # LiDAR is only an emergency safety check; if it triggers, the
+            # stopped-scan/map-alignment assumption failed and must be logged.
             if intended_occupied:
                 stop_motors(ard)
+                heading_error = normalize_angle_deg(target_bearing - current_heading)
                 log_nav_event(
                     "blocked_or_hard_stop",
                     {
@@ -1195,6 +1344,27 @@ def run():
                         "current_heading_deg": current_heading,
                         "active_waypoint_cell_x": wp.cell_x,
                         "active_waypoint_cell_y": wp.cell_y,
+                    },
+                )
+                nav.publish_adjacent_scan(fix, current_heading, scan)
+                log_nav_error(
+                    "unexpected_obstacle_while_moving",
+                    "LiDAR intended-sector obstacle detected while moving toward a waypoint that should have been pre-scanned free",
+                    {
+                        "reason": "intended_cell_occupied",
+                        "intended_sector": intended_sector,
+                        "intended_distance_m": intended_distance,
+                        "current_lat": fix.lat,
+                        "current_lon": fix.lon,
+                        "current_heading_deg": current_heading,
+                        "target_bearing_deg": target_bearing,
+                        "heading_error_deg": heading_error,
+                        "waypoint_lat": wp.lat,
+                        "waypoint_lon": wp.lon,
+                        "waypoint_cell_x": wp.cell_x,
+                        "waypoint_cell_y": wp.cell_y,
+                        "distance_to_waypoint_m": dist_m,
+                        "scan": scan,
                     },
                 )
                 nav.publish_status(
@@ -1211,6 +1381,12 @@ def run():
                 time.sleep(IDLE_SLEEP_S)
                 continue
 
+            # Steering is proportional to the heading error. Positive error means
+            # steer right, negative means steer left.
+            err = normalize_angle_deg(target_bearing - current_heading)
+            servo_angle = steering_from_heading_error(err)
+            throttle_pwm = throttle_from_distance(dist_m)
+
             # Publish moving status periodically.
             now = time.time()
             if now - last_status_publish >= STATUS_PUBLISH_INTERVAL_S:
@@ -1222,34 +1398,22 @@ def run():
                         "distance_to_waypoint_m": dist_m,
                         "target_bearing_deg": target_bearing,
                         "intended_sector": intended_sector,
+                        "heading_error_deg": err,
+                        "servo_angle": servo_angle,
+                        "throttle_pwm": throttle_pwm,
+                        "ground_speed_mps": fix.ground_speed_mps,
                     },
                 )
                 last_status_publish = now
 
             print(
                 f"{ts()} NAV dist={dist_m:.2f}m target={target_bearing:.1f}deg "
-                f"heading={current_heading} intended={intended_sector}"
+                f"heading={current_heading:.1f}deg err={err:.1f}deg "
+                f"servo={servo_angle} pwm={throttle_pwm} intended={intended_sector}"
             )
-
-            # Burst control copied conceptually from current navigation:
-            # use UBX NAV-PVT headMot to decide whether to steer left/right/forward.
-
-            err = normalize_angle_deg(target_bearing - current_heading)
-            if err > BIG_ERR_DEG:
-                print(f"{ts()} Large right error {err:.1f}deg -> R burst")
-                do_burst(ard, "R", TURN_BURST_S)
-            elif err < -BIG_ERR_DEG:
-                print(f"{ts()} Large left error {err:.1f}deg -> L burst")
-                do_burst(ard, "L", TURN_BURST_S)
-            elif err > SMALL_ERR_DEG:
-                print(f"{ts()} Small right error {err:.1f}deg -> R burst")
-                do_burst(ard, "R", SMALL_TURN_BURST_S)
-            elif err < -SMALL_ERR_DEG:
-                print(f"{ts()} Small left error {err:.1f}deg -> L burst")
-                do_burst(ard, "L", SMALL_TURN_BURST_S)
-            else:
-                print(f"{ts()} Aligned err={err:.1f}deg -> F burst")
-                do_burst(ard, "F", F_BURST_S)
+            send_drive_command(ard, servo_angle, throttle_pwm)
+            elapsed_s = time.time() - loop_start
+            time.sleep(max(0.0, CONTROL_DT_S - elapsed_s))
 
     finally:
         print(f"{ts()} Shutting down navigation")
@@ -1279,4 +1443,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
