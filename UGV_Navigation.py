@@ -127,6 +127,7 @@ LIDAR_YAW_OFFSET_DEG = 0.0
 
 # Adjacent LiDAR scans are only published at waypoint arrival for this phase.
 STATUS_PUBLISH_INTERVAL_S = 0.8
+STARTUP_REPUBLISH_INTERVAL_S = 1.0
 
 
 # ===========================================================
@@ -137,6 +138,7 @@ TOPIC_CMD_WAYPOINT = f"/ugv/{ROBOT_ID}/cmd/waypoint"
 TOPIC_CMD_STOP = f"/ugv/{ROBOT_ID}/cmd/stop"
 
 TOPIC_NAV_STARTUP = f"/ugv/{ROBOT_ID}/nav/startup"
+TOPIC_NAV_STARTUP_ACK = f"/ugv/{ROBOT_ID}/nav/startup_ack"
 TOPIC_NAV_STATUS = f"/ugv/{ROBOT_ID}/nav/status"
 TOPIC_NAV_ADJACENT_SCAN = f"/ugv/{ROBOT_ID}/nav/adjacent_scan"
 
@@ -242,6 +244,7 @@ def nav_program_start_fields() -> Dict[str, Any]:
             "approach_pwm": APPROACH_PWM,
             "cruise_pwm": CRUISE_PWM,
             "control_dt_s": CONTROL_DT_S,
+            "startup_republish_interval_s": STARTUP_REPUBLISH_INTERVAL_S,
             "lidar_occupied_threshold_m": LIDAR_OCCUPIED_THRESHOLD_M,
             "lidar_hard_stop_m": LIDAR_HARD_STOP_M,
         },
@@ -927,6 +930,8 @@ def sector_item(scan: List[Dict[str, Any]], direction: str) -> Optional[Dict[str
 class NavigationNode:
     def __init__(self):
         self.state = SharedState()
+        self.startup_ack_lock = threading.Lock()
+        self.startup_ack_received = False
         self.client = mqtt.Client(client_id=f"navigation_{ROBOT_ID}")
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
@@ -938,8 +943,12 @@ class NavigationNode:
             return
         client.subscribe(TOPIC_CMD_WAYPOINT)
         client.subscribe(TOPIC_CMD_STOP)
-        log_nav_event("mqtt_connected", {"topics": [TOPIC_CMD_WAYPOINT, TOPIC_CMD_STOP]})
-        print(f"{ts()} MQTT connected. Subscribed to {TOPIC_CMD_WAYPOINT} and {TOPIC_CMD_STOP}")
+        client.subscribe(TOPIC_NAV_STARTUP_ACK)
+        log_nav_event("mqtt_connected", {"topics": [TOPIC_CMD_WAYPOINT, TOPIC_CMD_STOP, TOPIC_NAV_STARTUP_ACK]})
+        print(
+            f"{ts()} MQTT connected. Subscribed to {TOPIC_CMD_WAYPOINT}, "
+            f"{TOPIC_CMD_STOP}, and {TOPIC_NAV_STARTUP_ACK}"
+        )
 
     def on_message(self, client, userdata, msg):
         try:
@@ -953,6 +962,15 @@ class NavigationNode:
             print(f"{ts()} STOP command received: {data}")
             log_nav_event("stop_command_received", {"payload": data})
             self.state.request_stop()
+            return
+
+        if msg.topic == TOPIC_NAV_STARTUP_ACK:
+            if data.get("robot_id") == ROBOT_ID:
+                with self.startup_ack_lock:
+                    first_ack = not self.startup_ack_received
+                    self.startup_ack_received = True
+                log_nav_event("startup_ack_received", {"payload": data, "first_ack": first_ack})
+                print(f"{ts()} Startup ACK received from TaskManager: {data}")
             return
 
         if msg.topic == TOPIC_CMD_WAYPOINT:
@@ -991,6 +1009,10 @@ class NavigationNode:
     def disconnect(self):
         self.client.loop_stop()
         self.client.disconnect()
+
+    def has_startup_ack(self) -> bool:
+        with self.startup_ack_lock:
+            return self.startup_ack_received
 
     def publish_status(self, fix: Fix, heading_deg: Optional[float], status: str, extra: Optional[Dict[str, Any]] = None):
         payload: Dict[str, Any] = {
@@ -1096,7 +1118,9 @@ def run():
 
     nav.connect()
 
-    startup_published = False
+    startup_fix: Optional[Fix] = None
+    startup_heading: Optional[float] = None
+    last_startup_publish = 0.0
     last_status_publish = 0.0
     last_quality_debug = 0.0
     navigation_was_usable = False
@@ -1149,7 +1173,9 @@ def run():
                 rtk_loss_reported = False
             navigation_was_usable = True
 
-            if heading_acquisition_failed and not startup_published:
+            startup_ack_received = nav.has_startup_ack()
+
+            if heading_acquisition_failed and not startup_ack_received:
                 stop_motors(ard)
                 now = time.time()
                 if now - last_status_publish >= STATUS_PUBLISH_INTERVAL_S:
@@ -1158,7 +1184,7 @@ def run():
                 time.sleep(IDLE_SLEEP_S)
                 continue
 
-            if INITIAL_HEADING_ENABLED and not startup_published and last_valid_heading_deg is None:
+            if INITIAL_HEADING_ENABLED and not startup_ack_received and last_valid_heading_deg is None:
                 result = acquire_initial_heading(
                     gps,
                     ard,
@@ -1198,10 +1224,23 @@ def run():
                 time.sleep(IDLE_SLEEP_S)
                 continue
 
-            if not startup_published:
-                # Do not move before a valid GPS startup message has been published.
-                nav.publish_startup(fix, current_heading)
-                startup_published = True
+            if startup_fix is None:
+                startup_fix = fix
+                startup_heading = current_heading
+
+            startup_ack_received = nav.has_startup_ack()
+            if not startup_ack_received:
+                stop_motors(ard)
+                now = time.time()
+                if now - last_startup_publish >= STARTUP_REPUBLISH_INTERVAL_S:
+                    # Do not move before TaskManager acknowledges the startup
+                    # GPS used to initialize its map. Republish the first
+                    # startup fix/heading so a late TaskManager sees the same
+                    # map origin Navigation originally announced.
+                    nav.publish_startup(startup_fix, startup_heading)
+                    last_startup_publish = now
+                time.sleep(IDLE_SLEEP_S)
+                continue
 
             if wp is None:
                 stop_motors(ard)
@@ -1443,4 +1482,5 @@ def run():
 
 if __name__ == "__main__":
     run()
+
 
