@@ -60,7 +60,8 @@ MQTT_BROKER_PORT = 1883
 MQTT_KEEPALIVE = 10
 
 TRIAL_ID = time.strftime("%Y%m%d-%H%M%S")
-LOG_DIR = "/home/jetson-nano/ugv/logs"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
 NAV_EVENT_LOG_FILE = "nav-events.jsonl"
 NAV_ERROR_LOG_FILE = "nav-errors.jsonl"
 
@@ -214,6 +215,8 @@ def nav_program_start_fields() -> Dict[str, Any]:
         "robot_id": ROBOT_ID,
         "script_name": os.path.basename(__file__),
         "timestamp": time.time(),
+        "script_dir": SCRIPT_DIR,
+        "log_dir": LOG_DIR,
         "current_working_directory": os.getcwd(),
         "event_log": NAV_EVENT_LOG_PATH,
         "error_log": NAV_ERROR_LOG_PATH,
