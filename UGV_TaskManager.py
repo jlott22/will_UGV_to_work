@@ -123,6 +123,7 @@ STARTUP_TIMEOUT_S = None        # None = wait indefinitely for my GPS and peer s
 # navigation, detection, or ESP-NOW bridge uses different topic names.
 
 TOPIC_NAV_STARTUP = f"/ugv/{ROBOT_ID}/nav/startup"       # nav -> task_manager
+TOPIC_NAV_STARTUP_ACK = f"/ugv/{ROBOT_ID}/nav/startup_ack"  # task_manager -> nav
 TOPIC_NAV_STATUS = f"/ugv/{ROBOT_ID}/nav/status"         # nav -> task_manager
 TOPIC_NAV_ADJACENT_SCAN = f"/ugv/{ROBOT_ID}/nav/adjacent_scan"  # nav -> task_manager
 TOPIC_CLUE = f"/ugv/{ROBOT_ID}/detections/clue"          # detector -> task_manager
@@ -538,6 +539,7 @@ class AuctionGreedyTaskManager:
         self.my_pose = Pose(lat, lon, data.get("heading_deg"), data.get("timestamp", time.time()))
         self.heading_index = heading_index_from_degrees(data.get("heading_deg"))
         log_task_event("nav_startup_received", {"payload": data, "startup_gps": self.my_startup_gps, "heading_index": self.heading_index})
+        self.publish_nav_startup_ack(data)
 
         self.publish_peer("startup", {
             "lat": lat,
@@ -545,6 +547,16 @@ class AuctionGreedyTaskManager:
             "heading_deg": data.get("heading_deg"),
         })
         self.try_initialize_map()
+
+    def publish_nav_startup_ack(self, startup_payload: Dict[str, Any]):
+        payload = {
+            "robot_id": ROBOT_ID,
+            "status": "startup_received",
+            "startup_timestamp": startup_payload.get("timestamp"),
+            "timestamp": time.time(),
+        }
+        self.client.publish(TOPIC_NAV_STARTUP_ACK, json.dumps(payload))
+        log_task_event("nav_startup_ack_published", {"payload": payload})
 
     def handle_nav_status(self, data: Dict[str, Any]):
         """
