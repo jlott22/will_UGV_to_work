@@ -128,6 +128,7 @@ LIDAR_YAW_OFFSET_DEG = 0.0
 # Adjacent LiDAR scans are only published at waypoint arrival for this phase.
 STATUS_PUBLISH_INTERVAL_S = 0.8
 STARTUP_REPUBLISH_INTERVAL_S = 1.0
+GPS_FAILURE_BUZZER_DELAY_S = 5.0
 
 
 # ===========================================================
@@ -245,6 +246,7 @@ def nav_program_start_fields() -> Dict[str, Any]:
             "cruise_pwm": CRUISE_PWM,
             "control_dt_s": CONTROL_DT_S,
             "startup_republish_interval_s": STARTUP_REPUBLISH_INTERVAL_S,
+            "gps_failure_buzzer_delay_s": GPS_FAILURE_BUZZER_DELAY_S,
             "lidar_occupied_threshold_m": LIDAR_OCCUPIED_THRESHOLD_M,
             "lidar_hard_stop_m": LIDAR_HARD_STOP_M,
         },
@@ -399,6 +401,35 @@ def send_cmd(ser: serial.Serial, cmd: str):
     except Exception as exc:
         log_nav_error("serial_write_failure", exc, {"cmd": cmd})
         raise
+
+
+BUZZER_DESCRIPTIONS = {
+    "B1": "navigation_process_started",
+    "B2": "mqtt_connected",
+    "B3": "gps_communication_verified",
+    "B4": "rtk_fixed",
+    "B5": "heading_acquired",
+    "B6": "startup_ack_received",
+    "B7": "mission_started",
+    "E1": "gps_failure",
+    "E2": "heading_acquisition_failed",
+    "E3": "emergency_stop",
+}
+
+
+def send_buzzer_event(ard: serial.Serial, code: str):
+    cmd = code if code.endswith("\n") else f"{code}\n"
+    try:
+        ard.write(cmd.encode("ascii"))
+        ard.flush()
+    except Exception as exc:
+        log_nav_error("buzzer_command_failed", exc, {"code": code})
+        raise
+    log_nav_event(
+        "buzzer_event",
+        {"code": code.rstrip("\n"), "description": BUZZER_DESCRIPTIONS.get(code.rstrip("\n"), "unknown")},
+    )
+    print(f"{ts()} BUZZER {code.rstrip()}")
 
 
 def read_arduino_lines(ard: serial.Serial, max_lines: int = 5):
@@ -675,6 +706,14 @@ def acquire_initial_heading(
             log_nav_event("heading_acquisition_failed", {"reason": "no_usable_start_fix"})
             if latest_fix is not None:
                 nav.publish_status(latest_fix, None, "heading_acquisition_failed")
+            try:
+                send_buzzer_event(ard, "E1")
+            except Exception:
+                pass
+            try:
+                send_buzzer_event(ard, "E2")
+            except Exception:
+                pass
             stop_motors(ard)
             return None
 
@@ -754,6 +793,10 @@ def acquire_initial_heading(
         log_nav_event("heading_acquisition_failed", {"reason": "attempt_or_timeout_limit"})
         if latest_fix is not None:
             nav.publish_status(latest_fix, None, "heading_acquisition_failed")
+        try:
+            send_buzzer_event(ard, "E2")
+        except Exception:
+            pass
         stop_motors(ard)
         return None
     except Exception:
@@ -932,6 +975,9 @@ class NavigationNode:
         self.state = SharedState()
         self.startup_ack_lock = threading.Lock()
         self.startup_ack_received = False
+        self.ard: Optional[serial.Serial] = None
+        self.mqtt_beep_sent = False
+        self.ack_beep_sent = False
         self.client = mqtt.Client(client_id=f"navigation_{ROBOT_ID}")
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
@@ -949,6 +995,12 @@ class NavigationNode:
             f"{ts()} MQTT connected. Subscribed to {TOPIC_CMD_WAYPOINT}, "
             f"{TOPIC_CMD_STOP}, and {TOPIC_NAV_STARTUP_ACK}"
         )
+        if self.ard is not None and not self.mqtt_beep_sent:
+            try:
+                send_buzzer_event(self.ard, "B2")
+                self.mqtt_beep_sent = True
+            except Exception:
+                pass
 
     def on_message(self, client, userdata, msg):
         try:
@@ -961,6 +1013,11 @@ class NavigationNode:
         if msg.topic == TOPIC_CMD_STOP:
             print(f"{ts()} STOP command received: {data}")
             log_nav_event("stop_command_received", {"payload": data})
+            if self.ard is not None:
+                try:
+                    send_buzzer_event(self.ard, "E3")
+                except Exception:
+                    pass
             self.state.request_stop()
             return
 
@@ -971,6 +1028,12 @@ class NavigationNode:
                     self.startup_ack_received = True
                 log_nav_event("startup_ack_received", {"payload": data, "first_ack": first_ack})
                 print(f"{ts()} Startup ACK received from TaskManager: {data}")
+                if self.ard is not None and not self.ack_beep_sent:
+                    try:
+                        send_buzzer_event(self.ard, "B6")
+                        self.ack_beep_sent = True
+                    except Exception:
+                        pass
             return
 
         if msg.topic == TOPIC_CMD_WAYPOINT:
@@ -1092,6 +1155,7 @@ def run():
 
     gps = open_serial_with_retry(GPS_PORT, GPS_BAUD, "GPS")
     ard = open_serial_with_retry(ARD_PORT, ARD_BAUD, "Arduino")
+    nav.ard = ard
 
     print(f"{ts()} Starting LiDAR process: {' '.join(LIDAR_CMD)}")
     lidar_proc = subprocess.Popen(
@@ -1114,6 +1178,10 @@ def run():
             log_nav_error("arduino_serial_reset_failed", exc, {"method": reset_method})
     stop_motors(ard)
     read_arduino_lines(ard)
+    try:
+        send_buzzer_event(ard, "B1")
+    except Exception:
+        pass
     time.sleep(ARDUINO_POST_STOP_WAIT_S)
 
     nav.connect()
@@ -1127,6 +1195,13 @@ def run():
     rtk_loss_reported = False
     last_valid_heading_deg: Optional[float] = None
     heading_acquisition_failed = False
+    gps_beep_sent = False
+    rtk_beep_sent = False
+    heading_beep_sent = False
+    ack_beep_sent = False
+    mission_beep_sent = False
+    gps_failure_started_at: Optional[float] = None
+    gps_failure_beep_sent = False
 
     try:
         print(f"{ts()} UGV_Navigation.py started for ROBOT_ID={ROBOT_ID}")
@@ -1143,6 +1218,17 @@ def run():
             if fix is None:
                 stop_motors(ard)
                 now = time.time()
+                if gps_failure_started_at is None:
+                    gps_failure_started_at = now
+                if (
+                    not gps_failure_beep_sent
+                    and now - gps_failure_started_at >= GPS_FAILURE_BUZZER_DELAY_S
+                ):
+                    try:
+                        send_buzzer_event(ard, "E1")
+                        gps_failure_beep_sent = True
+                    except Exception:
+                        pass
                 if navigation_was_usable:
                     print(f"{ts()} RTK FIX LOST")
                     gps_quality_alarm()
@@ -1155,8 +1241,24 @@ def run():
                 time.sleep(NO_FIX_SLEEP_S)
                 continue
 
+            gps_failure_started_at = None
+            gps_failure_beep_sent = False
+            if not gps_beep_sent:
+                try:
+                    send_buzzer_event(ard, "B3")
+                    gps_beep_sent = True
+                except Exception:
+                    pass
+
             usable_fix = fix_is_navigation_usable(fix)
             print_fix_debug(fix, "FIXED" if usable_fix else "NOT_USABLE")
+
+            if usable_fix and not navigation_was_usable and not rtk_beep_sent:
+                try:
+                    send_buzzer_event(ard, "B4")
+                    rtk_beep_sent = True
+                except Exception:
+                    pass
 
             if not usable_fix:
                 stop_motors(ard)
@@ -1198,6 +1300,12 @@ def run():
 
                 fix, acquired_heading = result
                 last_valid_heading_deg = acquired_heading
+                if not heading_beep_sent:
+                    try:
+                        send_buzzer_event(ard, "B5")
+                        heading_beep_sent = True
+                    except Exception:
+                        pass
 
             current_heading, last_valid_heading_deg, heading_updated = filtered_heading_from_fix(
                 fix,
@@ -1229,6 +1337,8 @@ def run():
                 startup_heading = current_heading
 
             startup_ack_received = nav.has_startup_ack()
+            if startup_ack_received and not ack_beep_sent:
+                ack_beep_sent = True
             if not startup_ack_received:
                 stop_motors(ard)
                 now = time.time()
@@ -1250,6 +1360,13 @@ def run():
                     last_status_publish = now
                 time.sleep(IDLE_SLEEP_S)
                 continue
+
+            if not mission_beep_sent:
+                try:
+                    send_buzzer_event(ard, "B7")
+                    mission_beep_sent = True
+                except Exception:
+                    pass
 
             dist_m = haversine_m(fix.lat, fix.lon, wp.lat, wp.lon)
             target_bearing = bearing_deg(fix.lat, fix.lon, wp.lat, wp.lon)
@@ -1320,6 +1437,10 @@ def run():
             # stopped-scan/map-alignment assumption failed and must be logged.
             if intended_distance is not None and intended_distance <= LIDAR_HARD_STOP_M:
                 stop_motors(ard)
+                try:
+                    send_buzzer_event(ard, "E3")
+                except Exception:
+                    pass
                 heading_error = normalize_angle_deg(target_bearing - current_heading)
                 log_nav_event(
                     "blocked_or_hard_stop",
@@ -1371,6 +1492,10 @@ def run():
             # stopped-scan/map-alignment assumption failed and must be logged.
             if intended_occupied:
                 stop_motors(ard)
+                try:
+                    send_buzzer_event(ard, "E3")
+                except Exception:
+                    pass
                 heading_error = normalize_angle_deg(target_bearing - current_heading)
                 log_nav_event(
                     "blocked_or_hard_stop",
@@ -1454,6 +1579,12 @@ def run():
             elapsed_s = time.time() - loop_start
             time.sleep(max(0.0, CONTROL_DT_S - elapsed_s))
 
+    except Exception:
+        try:
+            send_buzzer_event(ard, "E3")
+        except Exception:
+            pass
+        raise
     finally:
         print(f"{ts()} Shutting down navigation")
         log_nav_event("program_shutdown", nav_program_shutdown_fields(shutdown_reason))
