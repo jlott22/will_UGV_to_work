@@ -2015,4 +2015,3 @@ def planner_state_parts(state_idx: int) -> Tuple[int, int]:
 if __name__ == "__main__":
     manager = AuctionGreedyTaskManager()
     manager.start()
-
