@@ -66,7 +66,7 @@ NAV_EVENT_LOG_FILE = "nav-events.jsonl"
 NAV_ERROR_LOG_FILE = "nav-errors.jsonl"
 
 GPS_PORT = "/dev/ttyTHS1"
-GPS_BAUD = 115200
+GPS_BAUD = 38400
 
 ARD_PORT = "/dev/ttyUSB1"
 ARD_BAUD = 115200
@@ -102,8 +102,8 @@ ARDUINO_POST_STOP_WAIT_S = 0.5
 # GPS navigation tuning.
 WAYPOINT_RADIUS_M = 0.25
 SLOW_RADIUS_M = 0.75
-REQUIRE_RTK_FIXED = True
-MAX_H_ACC_M = 0.20
+REQUIRE_RTK_FIXED = False
+MAX_H_ACC_M = 0.9
 MIN_HEADING_SPEED_MPS = 0.30
 INITIAL_HEADING_ENABLED = True
 INITIAL_HEADING_MIN_MOVE_M = 1.0
@@ -414,9 +414,12 @@ BUZZER_DESCRIPTIONS = {
     "B5": "heading_acquired",
     "B6": "startup_ack_received",
     "B7": "mission_started",
+    "B8": "gps_accuracy_improved",
+    "B9": "differential_corrections_active",
     "E1": "gps_failure",
     "E2": "heading_acquisition_failed",
     "E3": "emergency_stop",
+    "E9": "differential_corrections_lost",
 }
 
 
@@ -644,7 +647,7 @@ def fix_is_navigation_usable(fix: Optional[Fix]) -> bool:
         return False
     if not fix.gnss_fix_ok:
         return False
-    if fix.carr_soln != 2:
+    if fix.carr_soln not in (1,2):
         return False
     return fix.h_acc_m <= MAX_H_ACC_M
 
@@ -1205,6 +1208,9 @@ def run():
     mission_beep_sent = False
     gps_failure_started_at: Optional[float] = None
     gps_failure_beep_sent = False
+    best_float_h_acc_m: Optional[float] = None
+    last_diff_soln = False
+    diff_corrections_beep_sent = False
 
     try:
         print(f"{ts()} UGV_Navigation.py started for ROBOT_ID={ROBOT_ID}")
@@ -1255,6 +1261,53 @@ def run():
 
             usable_fix = fix_is_navigation_usable(fix)
             print_fix_debug(fix, "FIXED" if usable_fix else "NOT_USABLE")
+            if fix.diff_soln and not last_diff_soln and not diff_corrections_beep_sent:
+                try:
+                    send_buzzer_event(ard, "B9")
+                    diff_corrections_beep_sent = True
+                except Exception:
+                    pass
+                log_nav_event(
+                    "differential_corrections_active",
+                    {
+                        "diff_soln": fix.diff_soln,
+                        "carr_soln": fix.carr_soln,
+                        "h_acc_m": fix.h_acc_m,
+                        "num_sv": fix.num_sv,
+                        "lat": fix.lat,
+                        "lon": fix.lon,
+                    },
+                )
+            if last_diff_soln and not fix.diff_soln:
+                diff_corrections_beep_sent = False
+                try:
+                    send_buzzer_event(ard, "E9")
+                except Exception:
+                    pass
+                log_nav_event(
+                    "differential_corrections_lost",
+                    {
+                        "diff_soln": fix.diff_soln,
+                        "carr_soln": fix.carr_soln,
+                        "h_acc_m": fix.h_acc_m,
+                        "num_sv": fix.num_sv,
+                        "lat": fix.lat,
+                        "lon": fix.lon,
+                    },
+                )
+            last_diff_soln = fix.diff_soln
+
+            if fix.carr_soln == 0:
+                if best_float_h_acc_m is None:
+                    best_float_h_acc_m = fix.h_acc_m
+                elif fix.h_acc_m < best_float_h_acc_m:
+                    try:
+                        send_buzzer_event(ard, "B8")
+                    except Exception:
+                        pass
+                    best_float_h_acc_m = fix.h_acc_m
+            else:
+                best_float_h_acc_m = None
 
             if usable_fix and not navigation_was_usable and not rtk_beep_sent:
                 try:
