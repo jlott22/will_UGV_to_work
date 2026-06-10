@@ -25,7 +25,7 @@ TODO:
 11. Later: implement ESP-NOW bridge for peer/outgoing and peer/incoming.
 12. Later: switch SINGLE_ROBOT_MODE to False and test two-robot startup/map sharing.
 - need sweep width because not only coordinates robot passes through are searched. We now have degrees of search.
-- Maybe only turn cameras on when LiDAR detects something.
+- Maybe only turn cameras on when LiDAR detects something. 
 
 """
 
